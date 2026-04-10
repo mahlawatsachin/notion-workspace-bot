@@ -55,7 +55,7 @@ def call_groq(prompt):
         "Content-Type": "application/json"
     }
     data = {
-        "model": "llama3-70b-8192",
+        "model": "llama-3.3-70b-versatile",
         "messages": [
             {"role": "system", "content": "You are a Notion workspace architect. Always respond with valid JSON only, no markdown, no explanation."},
             {"role": "user", "content": prompt}
@@ -98,7 +98,6 @@ Rules:
 - No extra text, just JSON"""
     
     raw = call_groq(prompt)
-    # Clean response
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
