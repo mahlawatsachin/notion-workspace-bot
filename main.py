@@ -2,12 +2,16 @@ import os
 import json
 import requests
 import telebot
+from telebot import types
 
 # === KEYS FROM ENV VARIABLES ===
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 NOTION_TOKEN = os.environ['NOTION_TOKEN']
 PARENT_PAGE_ID = os.environ['PARENT_PAGE_ID']
 GROQ_API_KEY = os.environ['GROQ_API_KEY']
+
+# === CONVERSATION STATE ===
+user_sessions = {}
 
 # === NOTION API ===
 NOTION_VERSION = "2022-06-28"
@@ -47,31 +51,71 @@ def update_database(db_id, properties):
     res.raise_for_status()
     return res.json()
 
-# === GROQ API (direct HTTP, no SDK) ===
-def call_groq(prompt):
+# === GROQ API ===
+def call_groq(prompt, system_msg=None):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
+    messages = []
+    if system_msg:
+        messages.append({"role": "system", "content": system_msg})
+    messages.append({"role": "user", "content": prompt})
+    
     data = {
         "model": "llama-3.3-70b-versatile",
-        "messages": [
-            {"role": "system", "content": "You are a Notion workspace architect. Always respond with valid JSON only, no markdown, no explanation."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.3,
-        "max_tokens": 4000
+        "messages": messages,
+        "temperature": 0.5,
+        "max_tokens": 2000
     }
     res = requests.post(url, headers=headers, json=data, timeout=60)
     res.raise_for_status()
     return res.json()["choices"][0]["message"]["content"]
 
-# === WORKSPACE SPEC GENERATOR ===
-def generate_workspace_spec(user_description):
-    prompt = f"""Create a Notion workspace spec for: {user_description}
+# === CONVERSATION FLOW ===
+def analyze_requirement(user_input):
+    """AI analyzes and asks clarifying questions"""
+    system = """You are a Notion workspace consultant. User wants to build a workspace. 
+    Analyze their requirement and ask 2-3 clarifying questions to understand:
+    - What data they'll track
+    - Their workflow
+    - Team size
+    - Key use cases
+    
+    Respond in Hinglish (Hindi+English mix) in a friendly tone. Keep it short and conversational."""
+    
+    prompt = f"""User ne kaha: \"{user_input}\"
+    
+Analyze karke 2-3 important questions pucho taaki workspace perfectly ban sake."""
+    
+    return call_groq(prompt, system)
 
-Return ONLY this JSON structure (no markdown):
+def generate_recommendation(conversation_history):
+    """AI gives opinion on ideal workspace structure"""
+    system = """You are a Notion workspace architect. Based on conversation, recommend the best workspace structure.
+    Give opinion on:
+    - Which databases to create
+    - Key properties and relationships
+    - Why this structure will work
+    
+    Respond in Hinglish, be opinionated but helpful. End with asking for confirmation."""
+    
+    prompt = f"""Conversation:
+{conversation_history}
+
+Now give your detailed recommendation for the ideal Notion workspace structure."""
+    
+    return call_groq(prompt, system)
+
+def generate_workspace_spec(conversation_history):
+    """Generate JSON spec from conversation"""
+    system = "You are a Notion workspace architect. Always respond with valid JSON only, no markdown, no explanation."
+    
+    prompt = f"""Based on this conversation:
+{conversation_history}
+
+Create a Notion workspace spec. Return ONLY this JSON structure (no markdown):
 {{
   "workspace_name": "Name Here",
   "databases": [
@@ -92,12 +136,13 @@ Return ONLY this JSON structure (no markdown):
 }}
 
 Rules:
-- 3-6 databases, each with 4-8 properties
+- 3-6 databases based on conversation
+- 4-8 properties per database
 - Property types: title(auto), select, multi_select, date, number, rich_text, checkbox, url, email, phone_number
-- Relations only between databases listed in this spec
+- Relations only between databases in this spec
 - No extra text, just JSON"""
     
-    raw = call_groq(prompt)
+    raw = call_groq(prompt, system)
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
@@ -106,7 +151,7 @@ Rules:
     raw = raw.strip()
     return json.loads(raw)
 
-# === PROPERTY BUILDER ===
+# === WORKSPACE BUILDER ===
 def build_properties_no_relations(db_spec):
     props = {"Name": {"title": {}}}
     for prop in db_spec.get("properties", []):
@@ -150,15 +195,8 @@ def build_relations(db_spec, db_name_to_id):
             }
     return props
 
-# === MAIN BUILD FUNCTION ===
-def build_workspace(user_description):
-    print(f"Building workspace for: {user_description}")
-    
-    print("Step 1: Generating spec with AI...")
-    spec = generate_workspace_spec(user_description)
+def build_workspace(spec):
     workspace_name = spec.get("workspace_name", "My Workspace")
-    
-    print(f"Step 2: Creating root page: {workspace_name}")
     root_page = create_page(PARENT_PAGE_ID, workspace_name)
     root_page_id = root_page["id"]
     root_url = root_page["url"]
@@ -166,24 +204,21 @@ def build_workspace(user_description):
     db_name_to_id = {}
     db_urls = {}
     
-    print("Step 3: Creating databases...")
     for db in spec["databases"]:
         props = build_properties_no_relations(db)
         db_res = create_database(root_page_id, db["name"], props)
         db_name_to_id[db["name"]] = db_res["id"]
         db_urls[db["name"]] = db_res["url"]
-        print(f"  Created: {db['name']}")
     
-    print("Step 4: Adding relations...")
     for db in spec["databases"]:
         rel_props = build_relations(db, db_name_to_id)
         if rel_props:
             try:
                 update_database(db_name_to_id[db["name"]], rel_props)
-            except Exception as e:
-                print(f"  Skipping relations for {db['name']}: {e}")
+            except:
+                pass
     
-    return {"root_url": root_url, "databases": db_name_to_id, "db_urls": db_urls}
+    return {"root_url": root_url, "db_urls": db_urls}
 
 # === TELEGRAM BOT ===
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -191,26 +226,80 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 @bot.message_handler(commands=['start', 'help'])
 def welcome(message):
     bot.reply_to(message,
-        "Steamtech Notion Workspace Builder\n\n"
-        "Plain English mein describe karo apna workspace:\n\n"
+        "🚀 *Steamtech Notion Workspace Builder*\n\n"
+        "Main tumhara Notion workspace consultant hoon!\n\n"
+        "Bas mujhe batao kya banana hai, main:\n"
+        "✅ Cross-questions karke clarify karunga\n"
+        "✅ Best structure recommend karunga\n"
+        "✅ Phir automatically Notion mein build kar dunga\n\n"
         "Example:\n"
-        "Build a CRM for dal mill clients with leads, orders, machines catalog and tasks\n\n"
-        "Main automatically Notion mein poora workspace bana dunga!"
+        "_\"Dal mill clients ke liye CRM banana hai\"_",
+        parse_mode="Markdown"
     )
 
 @bot.message_handler(func=lambda m: True)
 def handle(message):
-    bot.reply_to(message, "Building your Notion workspace... please wait 15-30 seconds")
+    user_id = message.from_user.id
+    user_text = message.text.strip()
+    
+    # Initialize session if new
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {
+            "stage": "initial",
+            "history": []
+        }
+    
+    session = user_sessions[user_id]
+    session["history"].append(f"User: {user_text}")
+    
     try:
-        result = build_workspace(message.text)
-        msg = "Workspace Built Successfully!\n\n"
-        msg += f"Root Page: {result['root_url']}\n\nDatabases:\n"
-        for name, url in result['db_urls'].items():
-            msg += f" - {name}: {url}\n"
-        bot.reply_to(message, msg)
+        if session["stage"] == "initial":
+            # Stage 1: Ask clarifying questions
+            bot.reply_to(message, "🤔 Samajh raha hoon... ek minute")
+            questions = analyze_requirement(user_text)
+            session["history"].append(f"Bot: {questions}")
+            session["stage"] = "clarifying"
+            bot.send_message(message.chat.id, questions)
+        
+        elif session["stage"] == "clarifying":
+            # Stage 2: Give recommendation
+            bot.reply_to(message, "💡 Analysis kar raha hoon...")
+            conversation = "\n".join(session["history"])
+            recommendation = generate_recommendation(conversation)
+            session["history"].append(f"Bot: {recommendation}")
+            session["stage"] = "recommending"
+            
+            # Add confirmation buttons
+            markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            markup.add("✅ Haan, build karo", "❌ Nahi, change karo")
+            bot.send_message(message.chat.id, recommendation, reply_markup=markup)
+        
+        elif session["stage"] == "recommending":
+            if "haan" in user_text.lower() or "yes" in user_text.lower() or "build" in user_text.lower():
+                # Stage 3: Build workspace
+                bot.reply_to(message, "🏗️ Building workspace... 20-30 seconds lagenge", reply_markup=types.ReplyKeyboardRemove())
+                conversation = "\n".join(session["history"])
+                spec = generate_workspace_spec(conversation)
+                result = build_workspace(spec)
+                
+                msg = "✅ *Workspace Ban Gaya!*\n\n"
+                msg += f"📄 Root Page: {result['root_url']}\n\n"
+                msg += "📊 Databases:\n"
+                for name, url in result['db_urls'].items():
+                    msg += f"  • [{name}]({url})\n"
+                
+                bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+                # Reset session
+                del user_sessions[user_id]
+            else:
+                # User wants changes
+                session["stage"] = "clarifying"
+                bot.send_message(message.chat.id, "Thik hai! Batao kya change karna hai?")
+    
     except Exception as e:
-        bot.reply_to(message, f"Error: {str(e)}\n\nPlease try again.")
-        print(f"Error: {e}")
+        bot.reply_to(message, f"❌ Error: {str(e)}\n\nDobara try karo ya /start se shuru karo")
+        if user_id in user_sessions:
+            del user_sessions[user_id]
 
 print("Bot starting...")
 bot.infinity_polling()
