@@ -2,288 +2,237 @@ import os
 import json
 import requests
 import telebot
-from datetime import datetime, timedelta
+from datetime import datetime
 import re
 
 # Config
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
-NOTION_TOKEN = os.environ['NOTION_TOKEN']
-PARENT_PAGE_ID = os.environ['PARENT_PAGE_ID']
 GROQ_API_KEY = os.environ['GROQ_API_KEY']
+GOOGLE_SHEETS_WEBHOOK = os.environ.get('GOOGLE_SHEETS_WEBHOOK', '')
+AUTHORIZED_USER_ID = int(os.environ.get('AUTHORIZED_USER_ID', '0'))
 
-NOTION_VERSION = "2022-06-28"
-NOTION_BASE = "https://api.notion.com/v1"
-
-# Session storage
-user_db_ids = {}  # Store database IDs per user
-
-# Notion API helpers
-def notion_headers():
-    return {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": NOTION_VERSION
-    }
-
-def search_notion(query=""):
-    data = {"query": query} if query else {}
-    res = requests.post(f"{NOTION_BASE}/search", headers=notion_headers(), json=data)
-    return res.json()
-
-def create_database(parent_id, title, properties):
-    data = {
-        "parent": {"type": "page_id", "page_id": parent_id},
-        "title": [{"type": "text", "text": {"content": title}}],
-        "properties": properties
-    }
-    res = requests.post(f"{NOTION_BASE}/databases", headers=notion_headers(), json=data)
-    return res.json()
-
-def create_page(database_id, properties):
-    data = {
-        "parent": {"database_id": database_id},
-        "properties": properties
-    }
-    res = requests.post(f"{NOTION_BASE}/pages", headers=notion_headers(), json=data)
-    return res.json()
-
-def query_database(database_id, filter_obj=None):
-    data = {}
-    if filter_obj:
-        data["filter"] = filter_obj
-    res = requests.post(f"{NOTION_BASE}/databases/{database_id}/query", headers=notion_headers(), json=data)
-    return res.json()
-
-def update_page(page_id, properties):
-    data = {"properties": properties}
-    res = requests.patch(f"{NOTION_BASE}/pages/{page_id}", headers=notion_headers(), json=data)
-    return res.json()
-
-def archive_page(page_id):
-    data = {"archived": True}
-    res = requests.patch(f"{NOTION_BASE}/pages/{page_id}", headers=notion_headers(), json=data)
-    return res.json()
-
-# Date parsing
-def parse_date(text):
-    text = text.lower().strip()
-    today = datetime.now()
-    
-    if text in ["aaj", "today", "आज"]:
-        return today.strftime("%Y-%m-%d")
-    elif text in ["kal", "tomorrow", "कल"]:
-        return (today + timedelta(days=1)).strftime("%Y-%m-%d")
-    elif text in ["parso", "परसों"]:
-        return (today + timedelta(days=2)).strftime("%Y-%m-%d")
-    elif "week" in text or "hafte" in text:
-        return (today + timedelta(days=7)).strftime("%Y-%m-%d")
-    return None
-
-# AI call
-def call_groq(prompt, system_msg=None):
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    messages = []
-    if system_msg:
-        messages.append({"role": "system", "content": system_msg})
-    messages.append({"role": "user", "content": prompt})
-    
-    data = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": messages,
-        "temperature": 0.3,
-        "max_tokens": 1000
-    }
-    
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    res = requests.post(url, headers=headers, json=data, timeout=30)
-    return res.json()["choices"][0]["message"]["content"]
-
-# Setup databases
-def setup_workspace(user_id):
-    # Create Tasks DB
-    tasks_props = {
-        "Name": {"title": {}},
-        "Status": {"select": {"options": [
-            {"name": "Todo", "color": "gray"},
-            {"name": "In Progress", "color": "blue"},
-            {"name": "Done", "color": "green"}
-        ]}},
-        "Priority": {"select": {"options": [
-            {"name": "High", "color": "red"},
-            {"name": "Medium", "color": "yellow"},
-            {"name": "Low", "color": "gray"}
-        ]}},
-        "Due Date": {"date": {}},
-        "Notes": {"rich_text": {}}
-    }
-    
-    tasks_db = create_database(PARENT_PAGE_ID, "📋 Tasks", tasks_props)
-    
-    # Create Meetings DB
-    meetings_props = {
-        "Name": {"title": {}},
-        "Date": {"date": {}},
-        "Attendees": {"rich_text": {}},
-        "Notes": {"rich_text": {}},
-        "Status": {"select": {"options": [
-            {"name": "Scheduled", "color": "blue"},
-            {"name": "Completed", "color": "green"},
-            {"name": "Cancelled", "color": "red"}
-        ]}}
-    }
-    
-    meetings_db = create_database(PARENT_PAGE_ID, "📅 Meetings", meetings_props)
-    
-    # Create Notes DB
-    notes_props = {
-        "Name": {"title": {}},
-        "Content": {"rich_text": {}},
-        "Category": {"select": {"options": [
-            {"name": "Work", "color": "blue"},
-            {"name": "Personal", "color": "green"},
-            {"name": "Ideas", "color": "purple"}
-        ]}},
-        "Created": {"date": {}}
-    }
-    
-    notes_db = create_database(PARENT_PAGE_ID, "📝 Notes", notes_props)
-    
-    # Store DB IDs
-    user_db_ids[user_id] = {
-        "tasks": tasks_db["id"],
-        "meetings": meetings_db["id"],
-        "notes": notes_db["id"]
-    }
-    
-    return user_db_ids[user_id]
-
-# Clean workspace
-def clean_workspace():
-    results = search_notion()
-    deleted = 0
-    
-    for item in results.get('results', []):
-        parent = item.get('parent', {})
-        if parent.get('type') == 'page_id' and parent.get('page_id') == PARENT_PAGE_ID:
-            archive_page(item['id'])
-            deleted += 1
-    
-    return deleted
-
-# Bot
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-@bot.message_handler(commands=['start', 'help'])
-def welcome(message):
-    bot.reply_to(message,
-        "🚀 *Notion Personal Assistant*\n\n"
-        "Commands:\n"
-        "/setup - Setup databases (first time)\n"
-        "/clean - Clean workspace\n\n"
-        "💬 Just chat naturally:\n"
-        "• Add task: Call vendor tomorrow\n"
-        "• Show my tasks\n"
-        "• Add meeting: Client call Monday 3pm\n"
-        "• Add note: Project ideas",
-        parse_mode="Markdown"
+# ─── Groq AI ───────────────────────────────────────────────────────────────
+def ask_groq(messages, system_prompt=None):
+    headers = {
+        'Authorization': f'Bearer {GROQ_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    msgs = []
+    if system_prompt:
+        msgs.append({'role': 'system', 'content': system_prompt})
+    msgs.extend(messages)
+    payload = {
+        'model': 'llama-3.3-70b-versatile',
+        'messages': msgs,
+        'temperature': 0.7,
+        'max_tokens': 1024
+    }
+    resp = requests.post(
+        'https://api.groq.com/openai/v1/chat/completions',
+        headers=headers,
+        json=payload,
+        timeout=30
+    )
+    resp.raise_for_status()
+    return resp.json()['choices'][0]['message']['content']
+
+# ─── Google Sheets (via Apps Script Web App) ───────────────────────────────
+def sheets_request(action, data=None):
+    if not GOOGLE_SHEETS_WEBHOOK:
+        return {'status': 'error', 'message': 'Google Sheets webhook not configured'}
+    payload = {'action': action}
+    if data:
+        payload.update(data)
+    try:
+        resp = requests.post(GOOGLE_SHEETS_WEBHOOK, json=payload, timeout=15)
+        return resp.json()
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}
+
+def add_entry(sheet_name, row_data):
+    return sheets_request('add', {'sheet': sheet_name, 'data': row_data})
+
+def get_entries(sheet_name, limit=10):
+    return sheets_request('get', {'sheet': sheet_name, 'limit': limit})
+
+def search_entries(sheet_name, query):
+    return sheets_request('search', {'sheet': sheet_name, 'query': query})
+
+def update_entry(sheet_name, row_id, updates):
+    return sheets_request('update', {'sheet': sheet_name, 'id': row_id, 'data': updates})
+
+# ─── AI Intent Parser ──────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are a smart personal assistant for a pulse processing machinery business (Steamtech Innovative Machinery Pvt Ltd).
+You help manage business data stored in Google Sheets with these sheets:
+- Leads: track potential customers (fields: name, company, phone, status, notes)
+- Orders: track machine orders (fields: customer, machine_type, quantity, value, status, date)
+- Tasks: manage to-dos (fields: title, priority, due_date, status, notes)
+- Contacts: store contacts (fields: name, company, phone, email, role)
+- Machines: track machine inventory/enquiries (fields: model, type, capacity, price, status)
+
+When user sends a message, respond with a JSON object (no markdown, pure JSON) with:
+{
+  "intent": "add|get|search|update|chat|summary",
+  "sheet": "Leads|Orders|Tasks|Contacts|Machines|null",
+  "data": {field: value pairs if adding/updating},
+  "query": "search term if searching",
+  "limit": number if getting records,
+  "reply": "friendly human response to show user"
+}
+
+For general questions or chitchat, use intent=chat and provide a helpful reply.
+Always be concise and business-focused."""
+
+conversation_history = {}
+
+def parse_intent(user_id, message):
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    
+    conversation_history[user_id].append({'role': 'user', 'content': message})
+    # Keep last 10 messages for context
+    history = conversation_history[user_id][-10:]
+    
+    raw = ask_groq(history, SYSTEM_PROMPT)
+    conversation_history[user_id].append({'role': 'assistant', 'content': raw})
+    
+    # Extract JSON
+    try:
+        # Try to find JSON in response
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            return json.loads(match.group())
+    except:
+        pass
+    return {'intent': 'chat', 'reply': raw, 'sheet': None}
+
+# ─── Action Executor ───────────────────────────────────────────────────────
+def execute_action(parsed):
+    intent = parsed.get('intent', 'chat')
+    sheet = parsed.get('sheet')
+    reply = parsed.get('reply', '')
+    
+    if intent == 'chat' or not sheet:
+        return reply
+    
+    if intent == 'add':
+        data = parsed.get('data', {})
+        data['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+        result = add_entry(sheet, data)
+        if result.get('status') == 'success':
+            return f"{reply}\n\n✅ Added to {sheet} successfully!"
+        else:
+            return f"{reply}\n\n❌ Error: {result.get('message', 'Unknown error')}"
+    
+    elif intent == 'get':
+        limit = parsed.get('limit', 10)
+        result = get_entries(sheet, limit)
+        if result.get('status') == 'success':
+            entries = result.get('data', [])
+            if not entries:
+                return f"No entries found in {sheet}."
+            text = f"📋 *{sheet}* (last {len(entries)}):\n\n"
+            for i, entry in enumerate(entries, 1):
+                text += f"*{i}.* " + " | ".join([f"{k}: {v}" for k, v in entry.items() if v]) + "\n"
+            return text
+        else:
+            return f"Error fetching {sheet}: {result.get('message')}"
+    
+    elif intent == 'search':
+        query = parsed.get('query', '')
+        result = search_entries(sheet, query)
+        if result.get('status') == 'success':
+            entries = result.get('data', [])
+            if not entries:
+                return f"No results found for '{query}' in {sheet}."
+            text = f"🔍 Found {len(entries)} result(s) in {sheet}:\n\n"
+            for i, entry in enumerate(entries, 1):
+                text += f"*{i}.* " + " | ".join([f"{k}: {v}" for k, v in entry.items() if v]) + "\n"
+            return text
+        else:
+            return f"Error searching {sheet}: {result.get('message')}"
+    
+    elif intent == 'summary':
+        # Get summary from all sheets
+        summary_text = "📊 *Business Summary*\n\n"
+        for s in ['Leads', 'Orders', 'Tasks']:
+            result = get_entries(s, 5)
+            if result.get('status') == 'success':
+                count = len(result.get('data', []))
+                summary_text += f"• {s}: {count} recent entries\n"
+        return summary_text + "\n" + reply
+    
+    return reply
+
+# ─── Telegram Handlers ─────────────────────────────────────────────────────
+def is_authorized(user_id):
+    if AUTHORIZED_USER_ID == 0:
+        return True  # No restriction if not set
+    return user_id == AUTHORIZED_USER_ID
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    if not is_authorized(message.from_user.id):
+        return
+    bot.reply_to(message, 
+        "👋 *Steamtech AI Assistant*\n\n"
+        "I'm your personal business assistant. I can help you:\n"
+        "• Add leads, orders, tasks, contacts\n"
+        "• Search and view your data\n"
+        "• Get business summaries\n"
+        "• Answer questions about your business\n\n"
+        "Just talk to me naturally! Example:\n"
+        "\'Add a lead: Ramesh from Delhi, interested in 2TPH dryer\'\n"
+        "\'Show my latest 5 orders\'\n"
+        "\'Search leads from Mumbai\'",
+        parse_mode='Markdown'
     )
 
-@bot.message_handler(commands=['setup'])
-def setup_cmd(message):
-    bot.reply_to(message, "⚙️ Setting up your Notion workspace...")
-    try:
-        user_id = message.from_user.id
-        dbs = setup_workspace(user_id)
-        bot.send_message(message.chat.id,
-            "✅ *Workspace Ready!*\n\n"
-            "Databases created:\n"
-            "📋 Tasks\n📅 Meetings\n📝 Notes\n\n"
-            "Now you can start chatting!",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
+@bot.message_handler(commands=['summary'])
+def summary(message):
+    if not is_authorized(message.from_user.id):
+        return
+    bot.send_chat_action(message.chat.id, 'typing')
+    parsed = {'intent': 'summary', 'sheet': 'Leads', 'reply': ''}
+    response = execute_action(parsed)
+    bot.reply_to(message, response, parse_mode='Markdown')
 
-@bot.message_handler(commands=['clean'])
-def clean_cmd(message):
-    bot.reply_to(message, "🧹 Cleaning workspace...")
-    try:
-        count = clean_workspace()
-        bot.send_message(message.chat.id, f"✅ Deleted {count} items. Workspace is clean!")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
+@bot.message_handler(commands=['help'])
+def help_cmd(message):
+    if not is_authorized(message.from_user.id):
+        return
+    bot.reply_to(message,
+        "*Commands:*\n"
+        "/start - Welcome message\n"
+        "/summary - Business overview\n"
+        "/help - This help\n\n"
+        "*Natural Language Examples:*\n"
+        "• 'Add lead: John, ABC Corp, 9876543210, interested in dryer'\n"
+        "• 'Show last 10 leads'\n"
+        "• 'Search orders for Sharma'\n"
+        "• 'Add task: Follow up with Delhi client, high priority, due tomorrow'\n"
+        "• 'What machines do we have?'\n"
+        "• 'How many orders this month?'",
+        parse_mode='Markdown'
+    )
 
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
-    user_id = message.from_user.id
-    text = message.text.lower()
-    
-    # Check if setup done
-    if user_id not in user_db_ids:
-        bot.reply_to(message, "⚠️ Please run /setup first!")
+    if not is_authorized(message.from_user.id):
         return
     
-    try:
-        # Add task
-        if "add task" in text or "task:" in text:
-            task_text = text.split(":")[1].strip() if ":" in text else text.replace("add task", "").strip()
-            
-            # Extract date
-            due_date = None
-            for word in task_text.split():
-                date = parse_date(word)
-                if date:
-                    due_date = date
-                    break
-            
-            props = {
-                "Name": {"title": [{"text": {"content": task_text}}]},
-                "Status": {"select": {"name": "Todo"}}
-            }
-            
-            if due_date:
-                props["Due Date"] = {"date": {"start": due_date}}
-            
-            create_page(user_db_ids[user_id]["tasks"], props)
-            bot.reply_to(message, f"✅ Task added: {task_text}")
-        
-        # Show tasks
-        elif "show" in text and "task" in text:
-            results = query_database(user_db_ids[user_id]["tasks"])
-            if not results.get("results"):
-                bot.reply_to(message, "No tasks found!")
-                return
-            
-            msg = "📋 *Your Tasks:*\n\n"
-            for page in results["results"][:10]:
-                title = page["properties"]["Name"]["title"][0]["plain_text"] if page["properties"]["Name"]["title"] else "Untitled"
-                status = page["properties"]["Status"]["select"]["name"] if page["properties"]["Status"]["select"] else "No status"
-                msg += f"• {title} - {status}\n"
-            
-            bot.reply_to(message, msg, parse_mode="Markdown")
-        
-        # Add note
-        elif "add note" in text or "note:" in text:
-            note_text = text.split(":")[1].strip() if ":" in text else text.replace("add note", "").strip()
-            
-            props = {
-                "Name": {"title": [{"text": {"content": note_text[:100]}}]},
-                "Content": {"rich_text": [{"text": {"content": note_text}}]},
-                "Created": {"date": {"start": datetime.now().strftime("%Y-%m-%d")}}
-            }
-            
-            create_page(user_db_ids[user_id]["notes"], props)
-            bot.reply_to(message, f"✅ Note saved!")
-        
-        else:
-            bot.reply_to(message, "I can help with:\n• Add task/note\n• Show tasks\n• Add meetings")
+    bot.send_chat_action(message.chat.id, 'typing')
     
+    try:
+        parsed = parse_intent(message.from_user.id, message.text)
+        response = execute_action(parsed)
+        bot.reply_to(message, response, parse_mode='Markdown')
     except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
+        bot.reply_to(message, f"⚠️ Error: {str(e)}\nPlease try again.")
 
-print("Bot starting...")
-bot.infinity_polling()
+# ─── Main ──────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    print('🤖 Steamtech AI Bot starting...')
+    bot.infinity_polling()
